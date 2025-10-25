@@ -1,0 +1,25 @@
+---
+- name: Install and Configure Nginx
+  hosts: webservers
+  become: yes  # This is the equivalent of using 'sudo'
+
+  tasks:
+    - name: Install Nginx for Amazon Linux 2
+      # This uses the 'amazon-linux-extras' command
+      community.general.amazon_linux_extras:
+        name: nginx1
+        state: present
+      when: ansible_distribution == 'Amazon' and ansible_distribution_major_version == '2'
+
+    - name: Install Nginx for Amazon Linux 2023
+      # This uses the modern 'dnf' package manager
+      ansible.builtin.dnf:
+        name: nginx
+        state: present
+      when: ansible_distribution == 'Amazon' and ansible_distribution_major_version == '2023'
+
+    - name: Ensure Nginx service is started and enabled on boot
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: yes
