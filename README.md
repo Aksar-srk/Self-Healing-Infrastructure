@@ -391,6 +391,8 @@ sudo systemctl start prometheus alertmanager webhook node_exporter
    ```
    Should show **active (running)** again.
 
+   ![CI/CD Architecture Diagram](images/vs.png)
+
 ---
 
 ## 🧯 Troubleshooting
