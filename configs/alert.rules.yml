@@ -1,5 +1,5 @@
 groups:
-  - name: AllInstances
+  - name: InstanceDown
     rules:
       - alert: InstanceDown
         expr: up == 0
