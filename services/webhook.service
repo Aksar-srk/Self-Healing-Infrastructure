@@ -1,0 +1,13 @@
+[Unit]
+Description=Ansible Webhook Receiver
+After=network.target
+
+[Service]
+User=ansible
+Group=ansible
+# NOTE: Use 'which python3' to confirm the path
+ExecStart=/usr/bin/python3 /home/ansible/webhook_receiver.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
