@@ -55,34 +55,7 @@ This reduces downtime and improves system reliability.
 
 ---
 
-## 📂 GitHub Repository Structure
 
-```
-self-healing-infrastructure/
-│
-├── ansible/
-│   ├── inventory
-│   └── restart_nginx.yml
-│
-├── services/
-│   ├── prometheus.service
-│   ├── alertmanager.service
-│   ├── webhook.service
-│   └── node_exporter.service
-│
-├── configs/
-│   ├── prometheus.yml
-│   ├── alert.rules.yml
-│   └── alertmanager.yml
-│
-├── webhook_receiver.py
-├── README.md
-└── screenshots/
-    ├── prometheus_targets.png
-    ├── alertmanager_alerts.png
-    ├── webhook_log.png
-    └── nginx_recovery.png
-```
 
 ---
 
@@ -93,6 +66,8 @@ self-healing-infrastructure/
 #### EC2 Instances
 - `monitoring-server`
 - `web-server`
+![CI/CD Architecture Diagram](screenshots/ec2.png)
+
 
 #### User & SSH Setup
 - Create `ansible` user on both servers
@@ -112,10 +87,11 @@ self-healing-infrastructure/
 
 ### Install Nginx
 ```bash
-sudo yum update -y
-sudo amazon-linux-extras install nginx1 -y
+sudo dnf update -y
+sudo dnf install nginx -y
 sudo systemctl start nginx
 sudo systemctl enable nginx
+sudo systemctl status nginx
 ```
 
 ### Install Node Exporter
@@ -183,30 +159,34 @@ rm -rf alertmanager*
 **`/etc/prometheus/prometheus.yml`**
 ```yaml
 global:
-  scrape_interval: 15s
+  scrape_interval: 10s
+
+rule_files:
+  - "/etc/prometheus/alert.rules.yml"
 
 alerting:
   alertmanagers:
     - static_configs:
         - targets: ['localhost:9093']
 
-rule_files:
-  - 'alert.rules.yml'
-
 scrape_configs:
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
 
-  - job_name: 'node_exporter'
+  - job_name: 'nginx'
     static_configs:
-      - targets: ['<WEB_SERVER_PRIVATE_IP>:9100']
+      - targets: ['<web-server-private-ip>:9113']
+
+  - job_name: 'node_exporter_web_server'
+    static_configs:
+      - targets: ['<web-server-private-ip>:9100']
 ```
 
 **`/etc/prometheus/alert.rules.yml`**
 ```yaml
 groups:
-  - name: AllInstances
+  - name: InstanceDown
     rules:
       - alert: InstanceDown
         expr: up == 0
@@ -216,6 +196,24 @@ groups:
         annotations:
           summary: 'Instance {{ $labels.instance }} down'
           description: '{{ $labels.instance }} of job {{ $labels.job }} has been down for more than 1 minute.'
+
+      - alert: HighCpuUsage
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100) > 90
+        for: 2m
+        labels:
+          severity: 'warning'
+        annotations:
+          summary: 'High CPU usage on {{ $labels.instance }}'
+          description: '{{ $labels.instance }} has had CPU usage above 90% for more than 2 minutes.'
+
+      - alert: NginxDown
+        expr: nginx_up{job="nginx"} == 0
+        for: 1m
+        labels:
+          severity: "critical"
+        annotations:
+          summary: "Nginx is down on {{ $labels.instance }}"
+          description: "The Nginx service is not responding. Ansible restart required."
 ```
 
 ---
@@ -224,13 +222,17 @@ groups:
 
 **`/etc/alertmanager/alertmanager.yml`**
 ```yaml
+global:
+  resolve_timeout: 5m
+
 route:
   receiver: 'ansible-webhook'
 
 receivers:
   - name: 'ansible-webhook'
     webhook_configs:
-      - url: 'http://127.0.0.1:5001/webhook'
+      - url: 'http://localhost:5001/'
+        send_resolved: true
 ```
 
 ---
@@ -239,21 +241,37 @@ receivers:
 
 **`~/ansible/inventory`**
 ```
-[webservers]
+[webs-erver]
 <WEB_SERVER_PRIVATE_IP>
 ```
 
 **`~/ansible/restart_nginx.yml`**
 ```yaml
 ---
-- name: Restart Nginx Service
+- name: Install and Configure Nginx
   hosts: webservers
-  become: yes
+  become: yes  # This is the equivalent of using 'sudo'
+
   tasks:
-    - name: Restart nginx
-      ansible.builtin.systemd:
+    - name: Install Nginx for Amazon Linux 2
+      # This uses the 'amazon-linux-extras' command
+      community.general.amazon_linux_extras:
+        name: nginx1
+        state: present
+      when: ansible_distribution == 'Amazon' and ansible_distribution_major_version == '2'
+
+    - name: Install Nginx for Amazon Linux 2023
+      # This uses the modern 'dnf' package manager
+      ansible.builtin.dnf:
         name: nginx
-        state: restarted
+        state: present
+      when: ansible_distribution == 'Amazon' and ansible_distribution_major_version == '2023'
+
+    - name: Ensure Nginx service is started and enabled on boot
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: yes
 ```
 
 Test:
@@ -274,22 +292,38 @@ pip3 install flask --user
 **`~/webhook_receiver.py`**
 ```python
 from flask import Flask, request
-import subprocess, json
+import subprocess
+import json
 
 app = Flask(__name__)
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.get_json()
-    if data and data['alerts'][0]['labels']['alertname'] == 'InstanceDown':
-        print("InstanceDown alert received! Triggering Ansible playbook...")
-        subprocess.run(['/usr/local/bin/ansible-playbook',
-                        '-i', '/home/ansible/ansible/inventory',
-                        '/home/ansible/ansible/restart_nginx.yml'])
-    return 'Alert processed', 200
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.data)
+            print("Alert received!")
+            print(json.dumps(data, indent=2))
 
-if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5001)
+            # Match your alert name and status
+            if data['status'] == 'firing' and data['alerts'][0]['labels']['alertname'] == 'NginxDown':
+                print("NginxDown alert firing. Triggering Ansible playbook...")
+
+                # Full absolute paths
+                playbook_path = '/home/ansible/ansible/restart_nginx.yml'
+                inventory_path = '/home/ansible/ansible/inventory'
+                private_key_path = '/home/ansible/.ssh/ansible_key'
+                ansible_path = '/home/ansible/.local/bin/ansible-playbook'
+
+                # Execute the playbook
+                process = subprocess.Popen(
+                    [ansible_path, '-i', inventory_path, '--private-key', private_key_path, playbook_path],
+                    cwd='/home/ansible',
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout, stderr = process.communicate()
 ```
 
 ---
@@ -370,29 +404,49 @@ sudo systemctl start prometheus alertmanager webhook node_exporter
 ## ✅ Step 8: Testing the Self-Healing System
 
 1. **Prometheus UI:**  
-   http://<monitoring-server-ip>:9090 → “Targets” → Node Exporter = UP  
+   http://<monitoring-server-ip>:9090 → “Targets” → Node Exporter = UP
+   ![CI/CD Architecture Diagram](screenshots/prometheus-before-testing.png)
+
+   
 2. **Simulate Failure (on web-server):**
    ```bash
    sudo systemctl stop nginx
    sudo systemctl stop node_exporter
    ```
-3. **Watch Webhook Logs:**
+   ![CI/CD Architecture Diagram](screenshots/cli-stop-nginx-manually-t0-test-flow.png)
+   - Prometheus UI
+   ![CI/CD Architecture Diagram](screenshots/prometheus-after-stoping-nginx.png)
+   - alertmanager UI
+   ![CI/CD Architecture Diagram](screenshots/alertmanager-after-manually-stop-nginx.png)
+   - nginx UI
+   ![CI/CD Architecture Diagram](screenshots/nginx-after-stoping-nginx.png)
+3. **Prometheus alert → Alertmanager → Webhook → Ansible → Nginx auto-restarts**
+   - Prometheus detects the failure. Prometheus sends the alert to Alertmanager
+   - Alertmanager immeditately forwards it to the webhook at http://127.0.0.1:5001/webhook.
+   - webhook received the alert and successfully executed the Ansible playbook.
+   ![CI/CD Architecture Diagram](screenshots/prometheus-after-automatically-playbook-execute.png)
+
+
+   
+5. **Watch Webhook Logs:**
    ```bash
    journalctl -u webhook -f
    ```
-4. **Expected Output:**
+6. **Expected Output:**
    ```
    InstanceDown alert received! Triggering Ansible playbook...
    PLAY [Restart Nginx Service] ...
    ```
-5. **Verify:**
+7. **Verify:**
    ```bash
    systemctl status nginx
    ```
    Should show **active (running)** again.
 
-   ![CI/CD Architecture Diagram](images/vs.png)
-
+   ![CI/CD Architecture Diagram](screenshots/checking-web-server-cli-status-nginx.png)
+   - nginx running successfully automaticatly
+   ![CI/CD Architecture Diagram](screenshots/nginx-afteroneminute-auto-playbook-execute.png)
+   
 ---
 
 ## 🧯 Troubleshooting
@@ -406,23 +460,4 @@ sudo systemctl start prometheus alertmanager webhook node_exporter
 
 ---
 
-## 📸 Recommended Screenshots
 
-| Screenshot | Description |
-|-------------|--------------|
-| prometheus_targets.png | Prometheus showing target UP/DOWN |
-| alertmanager_alerts.png | InstanceDown alert in Alertmanager |
-| webhook_log.png | Webhook triggering Ansible playbook |
-| nginx_recovery.png | Nginx restarted successfully |
-
----
-
-## 📜 License
-
-This project is open-source under the **MIT License**.  
-You can freely use or modify it for learning or demonstration purposes.
-
----
-
-**Author:** Aksar  
-**Project:** Self-Healing Infrastructure (Prometheus + Alertmanager + Ansible)
