@@ -1,0 +1,11 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: 'ansible-webhook'
+
+receivers:
+  - name: 'ansible-webhook'
+    webhook_configs:
+      - url: 'http://localhost:5001/'
+        send_resolved: true
